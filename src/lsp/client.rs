@@ -1,3 +1,5 @@
+#![allow(async_fn_in_trait)]
+
 use anyhow::{Context, Result};
 use lsp_types::Position;
 use serde_json::Value;

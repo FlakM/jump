@@ -8,13 +8,10 @@ pub trait SymbolExtractor {
     fn extract_symbol_info(&self, hover: &Value, definition: &Value) -> SymbolInfo;
 }
 
+#[derive(Default)]
 pub struct RustSymbolExtractor;
 
 impl RustSymbolExtractor {
-    pub fn new() -> Self {
-        Self
-    }
-
     fn extract_kind_and_name<'a>(&self, line: &'a str) -> Option<(&'a str, &'a str)> {
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() < 2 {
@@ -48,11 +45,29 @@ impl RustSymbolExtractor {
             _ => None,
         }
     }
-}
 
-impl Default for RustSymbolExtractor {
-    fn default() -> Self {
-        Self::new()
+    fn extract_let_binding<'a>(&self, line: &'a str) -> Option<(&'a str, &'a str)> {
+        let trimmed = line.trim();
+        let rest = trimmed.strip_prefix("let ")?;
+        let mut parts = rest.splitn(2, ':');
+        let name = parts.next()?.trim();
+        let ty = parts.next()?.trim();
+        if !name.is_empty() && !name.contains(' ') && !ty.is_empty() {
+            Some((name, ty))
+        } else {
+            None
+        }
+    }
+
+    fn extract_field<'a>(&self, line: &'a str) -> Option<&'a str> {
+        let trimmed = line.trim();
+        if trimmed.contains(':') && !trimmed.starts_with("fn ") && !trimmed.starts_with("pub fn ") {
+            let field_name = trimmed.split(':').next()?.trim();
+            if !field_name.is_empty() && !field_name.contains(' ') {
+                return Some(field_name);
+            }
+        }
+        None
     }
 }
 
@@ -71,7 +86,14 @@ impl SymbolExtractor for RustSymbolExtractor {
             return None;
         }
 
-        let module_path = lines[0];
+        let first_line = lines[0].trim();
+
+        // Handle let bindings: "let name: Type"
+        if let Some((name, ty)) = self.extract_let_binding(first_line) {
+            return Some(format!("let {}: {}", name, ty));
+        }
+
+        let module_path = first_line;
         if !module_path.contains("::") && lines.len() < 3 {
             return None;
         }
@@ -84,8 +106,12 @@ impl SymbolExtractor for RustSymbolExtractor {
                     return Some(format!("{} {}::{}", kind, module_path, name));
                 }
             } else if let Some((kind, name)) = self.extract_kind_and_name(trimmed) {
-                if idx > 0 && module_path.contains("::") {
+                if idx > 0 {
                     return Some(format!("{} {}::{}", kind, module_path, name));
+                }
+            } else if idx > 0 {
+                if let Some(field_name) = self.extract_field(trimmed) {
+                    return Some(format!("field {}::{}", module_path, field_name));
                 }
             }
         }
@@ -131,12 +157,13 @@ impl SymbolExtractor for RustSymbolExtractor {
         let (definition_uri, definition_line) = if let Some(arr) = definition.as_array() {
             if let Some(first) = arr.first() {
                 let uri = first.get("uri").and_then(|u| u.as_str()).map(String::from);
+                // LSP line numbers are 0-indexed, convert to 1-indexed
                 let line = first
                     .get("range")
                     .and_then(|r| r.get("start"))
                     .and_then(|s| s.get("line"))
                     .and_then(|l| l.as_u64())
-                    .map(|l| l as u32);
+                    .map(|l| (l + 1) as u32);
                 (uri, line)
             } else {
                 (None, None)
