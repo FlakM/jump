@@ -1,81 +1,124 @@
 # jump
 
-A CLI tool for navigating code references. Parse file links, GitHub URLs, or relative paths and open them directly in your editor.
+A CLI tool for navigating code references. Parse file links, GitHub URLs, or relative paths and open them directly in neovim.
 
 ## Why
 
-When working across multiple terminal windows, you often encounter file references in logs, error messages, or documentation. `jump` lets you quickly open these references in your existing neovim instance without manually switching windows or sessions.
+When working across multiple terminal windows, you constantly encounter file references—in logs, error messages, stack traces, or documentation. `jump` lets you open these references in your existing neovim instance without manually switching windows or copying paths.
 
 With Hyprland integration, `jump` automatically finds your main editor window and opens files there, regardless of which terminal you invoke it from.
 
-## Install
+## Installation
 
 ```bash
 cargo install --path .
 ```
 
+### Requirements
+
+- **neovim** with RPC socket enabled (default since 0.9)
+- **tmux**
+- **nvr** (neovim-remote) for sending commands to nvim
+- **Hyprland** (optional) for automatic window detection
+
 ## Usage
 
-### Jump to a file
+### Open a file reference
 
 ```bash
+# Check environment
+jump verify
+
 # Relative path with line number
-jump src/main.rs:11
+jump src/main.rs:42
 
 # Absolute path
 jump /home/user/project/src/lib.rs:100
 
 # GitHub permalink
-jump "https://github.com/FlakM/jump/blob/8fd8d1b77395f68ef9ca9ce85f070e2376923eae/src/main.rs#L11"
+jump "https://github.com/user/repo/blob/abc123/src/main.rs#L42"
+
+# Markdown link (strips markdown syntax)
+jump "[link](https://github.com/user/repo/blob/main/src/lib.rs#L10)"
+
+# File URI
+jump "file:///home/user/project/src/main.rs#L20"
 ```
+
+### Generate GitHub permalink
+
+```bash
+jump github-link --file src/main.rs --start-line 10 --end-line 20
+```
+
+Output:
+```json
+{
+  "url": "https://github.com/user/repo/blob/abc123/src/main.rs#L10-L20",
+  "relative_path": "src/main.rs",
+  "revision": "abc123...",
+  "lines": { "start": 10, "end": 20 },
+  "provider": "github"
+}
+```
+
+### Generate markdown reference with LSP
+
+```bash
+jump copy-markdown --root . --file src/main.rs --line 42 --character 10
+```
+
+Uses your language server to generate a markdown link with the symbol name:
+
+```json
+{
+  "markdown": "[fn main](file:///path/to/src/main.rs#L42)"
+}
+```
+
+With `--github` flag, generates a GitHub permalink instead of a local file URI.
 
 ### Other commands
 
 ```bash
-# Generate GitHub permalink
-jump github-link --file src/main.rs --start-line 10 --end-line 20
-{
-  "url": "https://github.com/FlakM/jump/blob/8fd8d1b77395f68ef9ca9ce85f070e2376923eae/src/main.rs#L10-L20",
-  "relative_path": "src/main.rs",
-  "revision": "8fd8d1b77395f68ef9ca9ce85f070e2376923eae",
-  "lines": {
-    "start": 10,
-    "end": 20
-  },
-  "provider": "github"
-}
-
-# Copy markdown link to clipboard
-jump copy-markdown --root . --file src/main.rs --line 11 --character 10
-{
-  "markdown": "[fn jump::main](file:///home/flakm/programming/flakm/jump/src/main.rs#L11)"
-}
+jump verify              # Check that required tools are installed
+jump completions bash    # Generate shell completions (bash, zsh, fish, etc.)
 ```
 
 ## How it works
 
-1. **Parse the link** - supports relative paths, absolute paths, and GitHub URLs
-2. **Find project root** - looks for `.git`, `Cargo.toml`, `package.json`, etc.
-3. **Locate editor** - finds your neovim instance via Hyprland window detection
-4. **Open file** - sends the file to neovim via its RPC socket
+```
+┌─────────────┐    ┌──────────────┐    ┌─────────────┐    ┌─────────┐
+│ Parse link  │───▶│ Find project │───▶│ Locate nvim │───▶│ Open    │
+│             │    │ root         │    │ instance    │    │ file    │
+└─────────────┘    └──────────────┘    └─────────────┘    └─────────┘
+```
+
+1. **Parse** - Handles relative paths, absolute paths, GitHub URLs, file URIs, markdown links
+2. **Locate** - Finds project root by walking up looking for `.git`, `Cargo.toml`, `package.json`, etc.
+3. **Resolve** - Validates the file exists and canonicalizes the path
+4. **Open** - Sends the file to neovim via tmux/nvr and hyprland
 
 ### Hyprland integration
 
 On Hyprland, `jump` automatically:
 - Finds the largest kitty window on workspace 1 (your main editor)
 - Maps it to the tmux session running in that window
-- Finds the first nvim pane in that session
+- Locates the nvim pane in that session
 - Opens files directly in that nvim instance
 
-This means you can run `jump` from any terminal and have files open in your editor window.
+This means you can run `jump` from any terminal and have files open in your primary editor window.
 
-## Requirements
+## Configuration
 
-- neovim (with RPC socket enabled - default since nvim 0.9)
-- tmux
-- neovim-remote (`nvr`) for sending commands to nvim
-- Hyprland (optional, for automatic window detection)
+Enable debug logging:
 
-## Environment
+```bash
+RUST_LOG=jump=debug jump src/main.rs:10
+```
 
-- `RUST_LOG=jump=info` - enable logging
+Custom project markers:
+
+```bash
+jump --markers=".project,.workspace" src/main.rs:10
+```
