@@ -21,12 +21,23 @@ pub trait ReferenceFormatter {
 pub struct MarkdownFormatter;
 
 impl MarkdownFormatter {
+    fn clean_symbol_name(name: &str) -> String {
+        let name = if let Some(idx) = name.find('<') {
+            &name[..idx]
+        } else {
+            name
+        };
+        name.trim_end_matches(['{', ';', ':', '(', ',', ' '])
+            .to_string()
+    }
+
     fn format_symbol_name(symbol: &SymbolInfo) -> String {
         if let Some(name) = &symbol.qualified_name {
+            let clean_name = Self::clean_symbol_name(name);
             if let Some(kind) = &symbol.kind {
-                format!("{} {}", kind, name)
+                format!("{} {}", kind, clean_name)
             } else {
-                name.clone()
+                clean_name
             }
         } else if let Some(kind) = &symbol.kind {
             kind.clone()
@@ -132,5 +143,50 @@ mod tests {
         let result = formatter.format_markdown(&symbol, None).unwrap();
 
         assert_eq!(result, "function crate::foo::Bar");
+    }
+
+    #[test]
+    fn test_clean_symbol_name_removes_generics() {
+        assert_eq!(
+            MarkdownFormatter::clean_symbol_name("TmuxSessionManager<E>"),
+            "TmuxSessionManager"
+        );
+        assert_eq!(
+            MarkdownFormatter::clean_symbol_name("TmuxSessionManager<E"),
+            "TmuxSessionManager"
+        );
+    }
+
+    #[test]
+    fn test_clean_symbol_name_removes_trailing_chars() {
+        assert_eq!(
+            MarkdownFormatter::clean_symbol_name("DEFAULT_TIMEOUT:"),
+            "DEFAULT_TIMEOUT"
+        );
+        assert_eq!(
+            MarkdownFormatter::clean_symbol_name("MyStruct{"),
+            "MyStruct"
+        );
+    }
+
+    #[test]
+    fn test_format_symbol_cleans_up_messy_names() {
+        let symbol = SymbolInfo {
+            qualified_name: Some("crate::tmux::TmuxSessionManager<E".to_string()),
+            kind: Some("struct".to_string()),
+            definition_uri: None,
+            definition_line: None,
+        };
+        let result = MarkdownFormatter::format_symbol_name(&symbol);
+        assert_eq!(result, "struct crate::tmux::TmuxSessionManager");
+
+        let symbol = SymbolInfo {
+            qualified_name: Some("crate::lsp::DEFAULT_TIMEOUT:".to_string()),
+            kind: Some("const".to_string()),
+            definition_uri: None,
+            definition_line: None,
+        };
+        let result = MarkdownFormatter::format_symbol_name(&symbol);
+        assert_eq!(result, "const crate::lsp::DEFAULT_TIMEOUT");
     }
 }

@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use lsp_types::Position;
 use serde_json::Value;
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::{debug, trace};
@@ -21,24 +22,51 @@ pub trait DefinitionProvider {
     async fn definition(&mut self, file_uri: &str, position: Position) -> Result<Value>;
 }
 
+pub const DEFAULT_LSP_TIMEOUT_MS: u64 = 30000;
+
 pub struct LspClient {
     child: Child,
     next_id: i32,
+    timeout: Duration,
+}
+
+fn server_needs_stdio_flag(server_path: &str) -> bool {
+    let server_name = std::path::Path::new(server_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(server_path);
+
+    matches!(
+        server_name,
+        "typescript-language-server" | "pyright-langserver" | "pyright"
+    )
 }
 
 impl LspClient {
     pub async fn new(server_path: &str) -> Result<Self> {
-        let child = Command::new("lspmux")
-            .arg("client")
-            .arg("--server-path")
-            .arg(server_path)
+        Self::with_timeout(server_path, Duration::from_millis(DEFAULT_LSP_TIMEOUT_MS)).await
+    }
+
+    pub async fn with_timeout(server_path: &str, timeout: Duration) -> Result<Self> {
+        let mut cmd = Command::new("lspmux");
+        cmd.arg("client").arg("--server-path").arg(server_path);
+
+        if server_needs_stdio_flag(server_path) {
+            cmd.arg("--").arg("--stdio");
+        }
+
+        let child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .context("Failed to spawn lspmux client")?;
 
-        Ok(Self { child, next_id: 1 })
+        Ok(Self {
+            child,
+            next_id: 1,
+            timeout,
+        })
     }
 
     async fn send_message(&mut self, message: &Value) -> Result<()> {
@@ -82,9 +110,15 @@ impl LspClient {
         Ok(message)
     }
 
+    async fn read_message_with_timeout(&mut self) -> Result<Value> {
+        tokio::time::timeout(self.timeout, self.read_message())
+            .await
+            .map_err(|_| anyhow::anyhow!("LSP read timeout after {:?}", self.timeout))?
+    }
+
     async fn wait_for_response(&mut self, expected_id: i32) -> Result<Value> {
         loop {
-            let message = self.read_message().await?;
+            let message = self.read_message_with_timeout().await?;
 
             if message.get("method").is_some() && message.get("id").is_none() {
                 debug!("Received notification: {}", message.get("method").unwrap());

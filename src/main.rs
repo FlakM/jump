@@ -38,6 +38,16 @@ async fn main() -> Result<()> {
                 }
             }
 
+            Commands::FormatSymbol(args) => {
+                use std::io::IsTerminal;
+                let output = jump::format_symbol(args.into())?;
+                if std::io::stdout().is_terminal() {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                } else {
+                    println!("{}", output.markdown);
+                }
+            }
+
             Commands::Verify => {
                 return verify_system();
             }

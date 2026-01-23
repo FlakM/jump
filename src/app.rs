@@ -5,16 +5,18 @@ use lsp_types::{
     TextDocumentItem, WorkspaceFolder,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use std::time::Duration;
+use tracing::{debug, info};
 
 use crate::{
-    DefinitionProvider, EnvAndSocketLocator, FastProjectScanner, FilesystemMaterializer,
-    GitHubPermalinkGenerator, HoverOutput, HoverProvider, JumpConfig, JumpLinkKind, JumpLinkParser,
-    JumpRequest, LinkParser, LspClient, LspConnection, MarkdownFormatter, MaterializedPath,
-    NeovimClient, NeovimInstanceLocator, PathMaterializer, PermalinkGenerator, ProjectRoot,
-    ProjectRootLocator, ReferenceFormatter, RustSymbolExtractor, SessionInfo, SessionInventory,
-    SessionProvisioner, SymbolExtractor, TmuxSessionManager,
+    create_extractor, detect_language, DefinitionProvider, EnvAndSocketLocator, FastProjectScanner,
+    FilesystemMaterializer, GitHubPermalinkGenerator, HoverOutput, HoverProvider, JumpConfig,
+    JumpLinkKind, JumpLinkParser, JumpRequest, LinkParser, LspClient, LspConnection,
+    MarkdownFormatter, MaterializedPath, NeovimClient, NeovimInstanceLocator, PathMaterializer,
+    PermalinkGenerator, ProjectRoot, ProjectRootLocator, ReferenceFormatter, SessionInfo,
+    SessionInventory, SessionProvisioner, TmuxSessionManager,
 };
 
 pub struct HoverRequest {
@@ -30,9 +32,12 @@ pub struct CopyMarkdownRequest {
     pub file: PathBuf,
     pub line: u32,
     pub character: u32,
-    pub server_path: String,
+    pub server_path: Option<String>,
     pub use_github_link: bool,
     pub remote: String,
+    pub lsp_init_delay_ms: u64,
+    pub lsp_max_retries: u32,
+    pub lsp_timeout_ms: u64,
 }
 
 impl From<crate::cli::CopyMarkdownArgs> for CopyMarkdownRequest {
@@ -45,8 +50,29 @@ impl From<crate::cli::CopyMarkdownArgs> for CopyMarkdownRequest {
             server_path: args.server_path,
             use_github_link: args.github,
             remote: args.remote,
+            lsp_init_delay_ms: args.lsp_init_delay_ms,
+            lsp_max_retries: args.lsp_max_retries,
+            lsp_timeout_ms: args.lsp_timeout_ms,
         }
     }
+}
+
+fn detect_lsp_server(path: &Path) -> &'static str {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| match ext {
+            "rs" => "rust-analyzer",
+            "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" => "typescript-language-server",
+            "py" | "pyw" | "pyi" => "pyright-langserver",
+            "go" => "gopls",
+            "lua" => "lua-language-server",
+            "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => "clangd",
+            "java" => "jdtls",
+            "zig" => "zls",
+            "nix" => "nil",
+            _ => "rust-analyzer",
+        })
+        .unwrap_or("rust-analyzer")
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,13 +112,15 @@ async fn initialize_lsp_client(
     workspace_name: String,
 ) -> Result<()> {
     info!("Initializing LSP client");
+    debug!("LSP workspace root URI: {}", root_uri);
+    debug!("LSP workspace name: {}", workspace_name);
 
     let init_params = InitializeParams {
         process_id: None,
         capabilities: ClientCapabilities::default(),
         workspace_folders: Some(vec![WorkspaceFolder {
             uri: root_uri.parse()?,
-            name: workspace_name,
+            name: workspace_name.clone(),
         }]),
         ..Default::default()
     };
@@ -108,13 +136,20 @@ async fn initialize_lsp_client(
     Ok(())
 }
 
-async fn open_document(client: &mut LspClient, file_uri: String, text: String) -> Result<()> {
-    info!("Opening document: {}", file_uri);
+async fn open_document(
+    client: &mut LspClient,
+    file_uri: String,
+    text: String,
+    language_id: &str,
+    init_delay_ms: u64,
+) -> Result<()> {
+    info!("Opening document: {} (language: {})", file_uri, language_id);
+    debug!("File URI: {}", file_uri);
 
     let did_open_params = DidOpenTextDocumentParams {
         text_document: TextDocumentItem {
             uri: file_uri.parse()?,
-            language_id: "rust".to_string(),
+            language_id: language_id.to_string(),
             version: 1,
             text,
         },
@@ -127,7 +162,8 @@ async fn open_document(client: &mut LspClient, file_uri: String, text: String) -
         )
         .await?;
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    debug!("Waiting {}ms for LSP to index document", init_delay_ms);
+    tokio::time::sleep(Duration::from_millis(init_delay_ms)).await;
 
     Ok(())
 }
@@ -140,6 +176,8 @@ pub async fn run(request: HoverRequest) -> Result<HoverOutput> {
         root.join(&request.file)
     }
     .canonicalize()?;
+
+    let language_id = detect_language(&file_path);
 
     let text = tokio::fs::read_to_string(&file_path)
         .await
@@ -156,7 +194,7 @@ pub async fn run(request: HoverRequest) -> Result<HoverOutput> {
         .to_string();
 
     initialize_lsp_client(&mut client, root_uri, workspace_name).await?;
-    open_document(&mut client, file_uri.clone(), text).await?;
+    open_document(&mut client, file_uri.clone(), text, language_id, 500).await?;
 
     let position = Position {
         line: request.line.saturating_sub(1),
@@ -172,7 +210,7 @@ pub async fn run(request: HoverRequest) -> Result<HoverOutput> {
     info!("Requesting definition");
     let definition_result = client.definition(&file_uri, position).await?;
 
-    let extractor = RustSymbolExtractor;
+    let extractor = create_extractor(language_id);
     let symbol_info = extractor.extract_symbol_info(&hover_result, &definition_result);
     let hover_text = extractor.extract_hover_text(&hover_result);
 
@@ -187,6 +225,40 @@ pub async fn run(request: HoverRequest) -> Result<HoverOutput> {
     Ok(output)
 }
 
+async fn fetch_symbol_with_retry(
+    client: &mut LspClient,
+    file_uri: &str,
+    position: Position,
+    max_retries: u32,
+) -> Result<(Value, Value)> {
+    for attempt in 0..=max_retries {
+        let hover = client.hover(file_uri, position).await?;
+        let definition = client.definition(file_uri, position).await?;
+
+        debug!(
+            "Attempt {}: hover_null={}, definition_null={}",
+            attempt + 1,
+            hover.is_null(),
+            definition.is_null()
+        );
+
+        if !hover.is_null() || !definition.is_null() {
+            return Ok((hover, definition));
+        }
+
+        if attempt < max_retries {
+            let delay_ms = 200 * 2u64.pow(attempt.min(4));
+            debug!(
+                "LSP returned empty, retry {} in {}ms",
+                attempt + 1,
+                delay_ms
+            );
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+    }
+    Ok((Value::Null, Value::Null))
+}
+
 pub async fn copy_markdown(request: CopyMarkdownRequest) -> Result<CopyMarkdownOutput> {
     let root = request.root.canonicalize()?;
     let file_path = if request.file.is_absolute() {
@@ -196,11 +268,18 @@ pub async fn copy_markdown(request: CopyMarkdownRequest) -> Result<CopyMarkdownO
     }
     .canonicalize()?;
 
+    let language_id = detect_language(&file_path);
+    let server_path = request
+        .server_path
+        .as_deref()
+        .unwrap_or_else(|| detect_lsp_server(&file_path));
+
     let text = tokio::fs::read_to_string(&file_path)
         .await
         .context("Failed to read file")?;
 
-    let mut client = LspClient::new(&request.server_path).await?;
+    let timeout = Duration::from_millis(request.lsp_timeout_ms);
+    let mut client = LspClient::with_timeout(server_path, timeout).await?;
 
     let root_uri = format!("file://{}", root.display());
     let file_uri = format!("file://{}", file_path.display());
@@ -211,7 +290,14 @@ pub async fn copy_markdown(request: CopyMarkdownRequest) -> Result<CopyMarkdownO
         .to_string();
 
     initialize_lsp_client(&mut client, root_uri, workspace_name).await?;
-    open_document(&mut client, file_uri.clone(), text).await?;
+    open_document(
+        &mut client,
+        file_uri.clone(),
+        text,
+        language_id,
+        request.lsp_init_delay_ms,
+    )
+    .await?;
 
     let position = Position {
         line: request.line.saturating_sub(1),
@@ -222,13 +308,14 @@ pub async fn copy_markdown(request: CopyMarkdownRequest) -> Result<CopyMarkdownO
         "Requesting hover and definition at line {}, character {} (1-indexed)",
         request.line, request.character
     );
-    let hover_result = client.hover(&file_uri, position).await?;
-    let definition_result = client.definition(&file_uri, position).await?;
 
-    tracing::debug!("Hover result: {:?}", hover_result);
-    tracing::debug!("Definition result: {:?}", definition_result);
+    let (hover_result, definition_result) =
+        fetch_symbol_with_retry(&mut client, &file_uri, position, request.lsp_max_retries).await?;
 
-    let extractor = RustSymbolExtractor;
+    debug!("Hover result: {:?}", hover_result);
+    debug!("Definition result: {:?}", definition_result);
+
+    let extractor = create_extractor(language_id);
     let symbol_info = extractor.extract_symbol_info(&hover_result, &definition_result);
     tracing::debug!("Symbol info: {:?}", symbol_info);
 
@@ -258,6 +345,181 @@ pub async fn copy_markdown(request: CopyMarkdownRequest) -> Result<CopyMarkdownO
 
     info!("Shutting down LSP client");
     client.shutdown().await?;
+
+    Ok(CopyMarkdownOutput { markdown })
+}
+
+pub struct FormatSymbolRequest {
+    pub root: PathBuf,
+    pub file: PathBuf,
+    pub line: u32,
+    pub hover_json: Option<String>,
+    pub definition_json: Option<String>,
+    pub hover_file: Option<PathBuf>,
+    pub definition_file: Option<PathBuf>,
+    pub use_github_link: bool,
+    pub remote: String,
+}
+
+impl From<crate::cli::FormatSymbolArgs> for FormatSymbolRequest {
+    fn from(args: crate::cli::FormatSymbolArgs) -> Self {
+        Self {
+            root: args.root,
+            file: args.file,
+            line: args.line,
+            hover_json: args.hover_json,
+            definition_json: args.definition_json,
+            hover_file: args.hover_file,
+            definition_file: args.definition_file,
+            use_github_link: args.github,
+            remote: args.remote,
+        }
+    }
+}
+
+fn parse_neovim_lsp_response(json: &str) -> Result<Value> {
+    let parsed: Value = serde_json::from_str(json).context("Failed to parse LSP JSON")?;
+
+    if parsed.is_null() || (parsed.is_object() && parsed.as_object().unwrap().is_empty()) {
+        return Ok(Value::Null);
+    }
+
+    // Neovim's vim.lsp.buf_request_sync returns different formats:
+    // 1. Object with client ID as key: {"2": {"result": ...}}
+    // 2. Array format: [{"result": ...}] or [{"err": ...}]
+    if let Some(arr) = parsed.as_array() {
+        for item in arr {
+            // Skip items with errors
+            if item.get("err").is_some() || item.get("error").is_some() {
+                continue;
+            }
+            if let Some(result) = item.get("result") {
+                if !result.is_null() {
+                    return Ok(convert_markdown_hover_to_plaintext(result));
+                }
+            }
+        }
+        // If all items had errors, return Null
+        return Ok(Value::Null);
+    }
+
+    if let Some(obj) = parsed.as_object() {
+        for (_client_id, client_response) in obj {
+            if let Some(result) = client_response.get("result") {
+                if !result.is_null() {
+                    return Ok(convert_markdown_hover_to_plaintext(result));
+                }
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn convert_markdown_hover_to_plaintext(result: &Value) -> Value {
+    let mut result = result.clone();
+    if let Some(contents) = result.get_mut("contents") {
+        if let Some(obj) = contents.as_object_mut() {
+            // Check if this is markdown format
+            if obj.get("kind").and_then(|k| k.as_str()) == Some("markdown") {
+                if let Some(value) = obj.get("value").and_then(|v| v.as_str()) {
+                    // Extract content from markdown code blocks
+                    let plaintext = extract_plaintext_from_markdown(value);
+                    obj.insert("kind".to_string(), Value::String("plaintext".to_string()));
+                    obj.insert("value".to_string(), Value::String(plaintext));
+                }
+            }
+        }
+    }
+    result
+}
+
+fn extract_plaintext_from_markdown(md: &str) -> String {
+    // Rust-analyzer markdown format: ```rust\nmodule\n```\n\n```rust\nfn name()\n```
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+
+    for line in md.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            continue;
+        }
+        if in_code_block && !trimmed.is_empty() {
+            lines.push(trimmed);
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn read_json_input(json_arg: Option<&str>, file_arg: Option<&PathBuf>) -> Result<String> {
+    if let Some(file_path) = file_arg {
+        std::fs::read_to_string(file_path)
+            .with_context(|| format!("Failed to read JSON from {:?}", file_path))
+    } else if let Some(json) = json_arg {
+        Ok(json.to_string())
+    } else {
+        Ok("{}".to_string())
+    }
+}
+
+pub fn format_symbol(request: FormatSymbolRequest) -> Result<CopyMarkdownOutput> {
+    let file_path = if request.file.is_absolute() {
+        request.file.clone()
+    } else {
+        request.root.join(&request.file)
+    };
+
+    let language_id = detect_language(&file_path);
+    debug!(
+        "Formatting symbol for {} (language: {})",
+        file_path.display(),
+        language_id
+    );
+
+    let hover_json = read_json_input(request.hover_json.as_deref(), request.hover_file.as_ref())?;
+    let definition_json = read_json_input(
+        request.definition_json.as_deref(),
+        request.definition_file.as_ref(),
+    )?;
+
+    debug!("Raw hover JSON: {}", &hover_json);
+    debug!("Raw definition JSON: {}", &definition_json);
+
+    let hover_result = parse_neovim_lsp_response(&hover_json)?;
+    let definition_result = parse_neovim_lsp_response(&definition_json)?;
+
+    debug!("Parsed hover result: {:?}", hover_result);
+    debug!("Parsed definition result: {:?}", definition_result);
+
+    let extractor = create_extractor(language_id);
+    let symbol_info = extractor.extract_symbol_info(&hover_result, &definition_result);
+    debug!("Symbol info: {:?}", symbol_info);
+
+    if symbol_info.qualified_name.is_none() && symbol_info.definition_uri.is_none() {
+        anyhow::bail!("No symbol found in provided LSP results");
+    }
+
+    let github_link = if request.use_github_link {
+        if let Some(def_uri) = &symbol_info.definition_uri {
+            let def_path = def_uri
+                .strip_prefix("file://")
+                .unwrap_or(def_uri)
+                .parse::<PathBuf>()?;
+
+            let generator = GitHubPermalinkGenerator::new(&def_path, Some(request.remote))?;
+            let line = symbol_info.definition_line.unwrap_or(1);
+            Some(generator.generate(&def_path, line, None)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let formatter = MarkdownFormatter;
+    let markdown = formatter.format_markdown(&symbol_info, github_link.as_ref())?;
 
     Ok(CopyMarkdownOutput { markdown })
 }

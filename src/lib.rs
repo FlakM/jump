@@ -12,8 +12,9 @@ pub mod symbol;
 pub mod tmux;
 
 pub use app::{
-    copy_markdown, jump, resolve_link, run, CopyMarkdownOutput, CopyMarkdownRequest, HoverRequest,
-    JumpInput, JumpOutcome, ResolveLinkOutput, ResolveLinkRequest,
+    copy_markdown, format_symbol, jump, resolve_link, run, CopyMarkdownOutput, CopyMarkdownRequest,
+    FormatSymbolRequest, HoverRequest, JumpInput, JumpOutcome, ResolveLinkOutput,
+    ResolveLinkRequest,
 };
 pub use config::{ConfigLoader, JumpConfig, ProjectConfig};
 pub use git::{GitHubLink, GitHubPermalinkGenerator, PermalinkGenerator};
@@ -27,8 +28,9 @@ pub use nvim::{
 pub use parser::{JumpLinkKind, JumpLinkParser, JumpRequest, LinkParser};
 pub use project::{FastProjectScanner, ProjectRoot, ProjectRootLocator};
 pub use symbol::{
-    CursorPosition, HoverOutput, LinkType, MarkdownFormatter, ReferenceFormatter,
-    RustSymbolExtractor, SymbolExtractor, SymbolInfo,
+    create_extractor, detect_language, CursorPosition, GenericSymbolExtractor, HoverOutput,
+    LinkType, MarkdownFormatter, ReferenceFormatter, RustSymbolExtractor, SymbolExtractor,
+    SymbolInfo,
 };
 pub use tmux::{
     NvimPaneInfo, SessionInfo, SessionInventory, SessionProvisioner, TmuxCommandExecutor,
