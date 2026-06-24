@@ -92,8 +92,8 @@ impl FilesystemMaterializer {
 
 impl FilesystemMaterializer {
     fn git_show_to_tempfile(root: &ProjectRoot, revision: &str, path: &Path) -> Result<PathBuf> {
-        let repo = git2::Repository::discover(&root.path)
-            .context("Failed to discover git repository")?;
+        let repo =
+            git2::Repository::discover(&root.path).context("Failed to discover git repository")?;
 
         let obj = repo
             .revparse_single(revision)
@@ -114,10 +114,7 @@ impl FilesystemMaterializer {
             .context("Failed to read blob from git object store")?;
 
         let short_rev = revision.get(..8).unwrap_or(revision);
-        let file_name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
         let temp_path = std::env::temp_dir().join(format!("jump_{}_{}", short_rev, file_name));
 
         debug!(

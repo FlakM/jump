@@ -622,12 +622,22 @@ fn locate_root(
         None => std::env::current_dir().context("Failed to get current directory")?,
     };
 
+    // For absolute paths, scan from the file's parent directory. But when the
+    // path is itself a directory (e.g. a `file://` link to a project root or
+    // git worktree), scan from the directory itself - taking its parent would
+    // skip past the project marker living inside it.
+    let absolute_start = |path: &Path| -> PathBuf {
+        if path.is_dir() {
+            path.to_path_buf()
+        } else {
+            path.parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("/"))
+        }
+    };
+
     let start_path: PathBuf = match jump_req.kind {
-        JumpLinkKind::Absolute => jump_req
-            .path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("/")),
+        JumpLinkKind::Absolute => absolute_start(&jump_req.path),
         JumpLinkKind::Github | JumpLinkKind::Relative => resolved_cwd,
     };
 
@@ -636,12 +646,10 @@ fn locate_root(
     }
 
     if jump_req.kind == JumpLinkKind::Absolute {
-        let fallback = jump_req
-            .path
-            .parent()
-            .unwrap_or_else(|| Path::new("/"))
-            .to_path_buf();
-        return Ok(ProjectRoot::new(fallback, "manual".to_string()));
+        return Ok(ProjectRoot::new(
+            absolute_start(&jump_req.path),
+            "manual".to_string(),
+        ));
     }
 
     anyhow::bail!(
@@ -916,6 +924,28 @@ mod tests {
         assert_eq!(output.materialized.line, Some(10));
         assert_eq!(output.materialized.end_line, None);
         assert_eq!(output.materialized.kind, JumpLinkKind::Github);
+    }
+
+    #[test]
+    fn resolves_directory_link_to_directory_root() {
+        // A `file://` link pointing at a project directory (e.g. a git worktree)
+        // must resolve to that directory, not its parent.
+        let (_temp, project_dir) = create_project();
+
+        let output = resolve_link(ResolveLinkRequest {
+            input: format!("file://{}", project_dir.display()),
+            root: None,
+            markers: None,
+            cwd: None,
+        })
+        .expect("directory link should resolve");
+
+        assert_eq!(output.request.kind, JumpLinkKind::Absolute);
+        assert_eq!(output.root.path, project_dir.canonicalize().unwrap());
+        assert_eq!(
+            output.materialized.absolute,
+            project_dir.canonicalize().unwrap()
+        );
     }
 
     // Integration with real tmux/nvr is intentionally skipped in unit tests.

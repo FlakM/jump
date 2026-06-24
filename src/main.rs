@@ -398,7 +398,6 @@ fn notify(title: &str, message: &str, success: bool) {
         .timeout(Timeout::Milliseconds(3000))
         .show();
 }
-
 fn setup_logging() {
     let log_dir = dirs::cache_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
