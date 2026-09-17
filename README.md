@@ -49,12 +49,17 @@ jump "file:///home/user/project/src/main.rs#L20"
 
 ```bash
 jump github-link --file src/main.rs --start-line 10 --end-line 20
+
+# label the link with the enclosing symbol (editors can pass it from LSP)
+jump github-link --file src/main.rs --start-line 10 --symbol "Server::run"
 ```
 
 Output:
 ```json
 {
   "url": "https://github.com/user/repo/blob/abc123/src/main.rs#L10-L20",
+  "markdown": "[src/main.rs:10-20](https://github.com/user/repo/blob/abc123/src/main.rs#L10-L20)",
+  "label": "src/main.rs:10-20",
   "relative_path": "src/main.rs",
   "revision": "abc123...",
   "lines": { "start": 10, "end": 20 },

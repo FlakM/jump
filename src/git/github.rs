@@ -6,7 +6,18 @@ use super::repo::{Git2Repository, GitRepository};
 use super::types::{GitHubLink, LineRange};
 
 pub trait PermalinkGenerator {
-    fn generate(&self, file: &Path, start_line: u32, end_line: Option<u32>) -> Result<GitHubLink>;
+    /// Generate a permalink, optionally labelling it with the enclosing symbol name.
+    fn generate_labeled(
+        &self,
+        file: &Path,
+        start_line: u32,
+        end_line: Option<u32>,
+        symbol: Option<&str>,
+    ) -> Result<GitHubLink>;
+
+    fn generate(&self, file: &Path, start_line: u32, end_line: Option<u32>) -> Result<GitHubLink> {
+        self.generate_labeled(file, start_line, end_line, None)
+    }
 }
 
 pub struct GitHubPermalinkGenerator {
@@ -24,6 +35,26 @@ impl GitHubPermalinkGenerator {
 
     fn is_github_url(url: &str) -> bool {
         url.contains("github.com")
+    }
+
+    fn format_lines(lines: &LineRange) -> String {
+        match lines.end {
+            Some(end) if end != lines.start => format!("{}-{}", lines.start, end),
+            _ => lines.start.to_string(),
+        }
+    }
+
+    /// Human readable label: `symbol (basename:lines)` when the caller knows the
+    /// enclosing symbol, otherwise the repo relative path with the line range.
+    fn build_label(relative_path: &str, lines: &LineRange, symbol: Option<&str>) -> String {
+        let lines = Self::format_lines(lines);
+        match symbol {
+            Some(symbol) if !symbol.trim().is_empty() => {
+                let basename = relative_path.rsplit('/').next().unwrap_or(relative_path);
+                format!("{} ({}:{})", symbol.trim(), basename, lines)
+            }
+            _ => format!("{}:{}", relative_path, lines),
+        }
     }
 
     fn build_github_url(
@@ -45,7 +76,13 @@ impl GitHubPermalinkGenerator {
 }
 
 impl PermalinkGenerator for GitHubPermalinkGenerator {
-    fn generate(&self, file: &Path, start_line: u32, end_line: Option<u32>) -> Result<GitHubLink> {
+    fn generate_labeled(
+        &self,
+        file: &Path,
+        start_line: u32,
+        end_line: Option<u32>,
+        symbol: Option<&str>,
+    ) -> Result<GitHubLink> {
         let info = self.repo.get_info(&self.remote_name)?;
 
         let relative_path = self
@@ -74,15 +111,13 @@ impl PermalinkGenerator for GitHubPermalinkGenerator {
 
         let url = Self::build_github_url(&info.remote_url, &info.revision, &relative_path, &lines);
 
-        let line_fragment = match lines.end {
-            Some(end) if end != lines.start => format!("#L{}-L{}", lines.start, end),
-            _ => format!("#L{}", lines.start),
-        };
-        let markdown = format!("[{}{}]({})", relative_path, line_fragment, url);
+        let label = Self::build_label(&relative_path, &lines, symbol);
+        let markdown = format!("[{}]({})", label, url);
 
         Ok(GitHubLink {
             url,
             markdown,
+            label,
             relative_path,
             revision: info.revision,
             lines,
@@ -94,6 +129,55 @@ impl PermalinkGenerator for GitHubPermalinkGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_label_without_symbol() {
+        let lines = LineRange {
+            start: 129,
+            end: Some(133),
+        };
+        assert_eq!(
+            GitHubPermalinkGenerator::build_label("pdp/src/services/check.rs", &lines, None),
+            "pdp/src/services/check.rs:129-133"
+        );
+
+        let lines = LineRange {
+            start: 129,
+            end: None,
+        };
+        assert_eq!(
+            GitHubPermalinkGenerator::build_label("pdp/src/services/check.rs", &lines, None),
+            "pdp/src/services/check.rs:129"
+        );
+    }
+
+    #[test]
+    fn test_build_label_with_symbol() {
+        let lines = LineRange {
+            start: 129,
+            end: Some(133),
+        };
+        assert_eq!(
+            GitHubPermalinkGenerator::build_label(
+                "pdp/src/services/check.rs",
+                &lines,
+                Some("CheckPermissionsService::check_permissions")
+            ),
+            "CheckPermissionsService::check_permissions (check.rs:129-133)"
+        );
+    }
+
+    #[test]
+    fn test_build_label_ignores_blank_symbol() {
+        let lines = LineRange {
+            start: 1,
+            end: Some(1),
+        };
+        assert_eq!(
+            GitHubPermalinkGenerator::build_label("src/main.rs", &lines, Some("  ")),
+            "src/main.rs:1"
+        );
+    }
 
     #[test]
     fn test_build_github_url() {

@@ -40,6 +40,10 @@ pub enum Commands {
         #[arg(long)]
         end_line: Option<u32>,
 
+        /// Enclosing symbol name used as the markdown label
+        #[arg(long, value_hint = ValueHint::Other)]
+        symbol: Option<String>,
+
         /// Git remote name
         #[arg(long, default_value = "origin")]
         remote: String,

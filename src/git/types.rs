@@ -5,6 +5,7 @@ use std::path::PathBuf;
 pub struct GitHubLink {
     pub url: String,
     pub markdown: String,
+    pub label: String,
     pub relative_path: String,
     pub revision: String,
     pub lines: LineRange,

@@ -91,7 +91,8 @@ mod tests {
         let github_link = GitHubLink {
             url: "https://github.com/rust-lang/rust/blob/abc123/library/std/src/path.rs#L42"
                 .to_string(),
-            markdown: "[library/std/src/path.rs#L42](https://github.com/rust-lang/rust/blob/abc123/library/std/src/path.rs#L42)".to_string(),
+            markdown: "[library/std/src/path.rs:42](https://github.com/rust-lang/rust/blob/abc123/library/std/src/path.rs#L42)".to_string(),
+            label: "library/std/src/path.rs:42".to_string(),
             relative_path: "library/std/src/path.rs".to_string(),
             revision: "abc123".to_string(),
             lines: LineRange {

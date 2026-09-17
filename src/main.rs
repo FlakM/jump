@@ -20,11 +20,13 @@ async fn main() -> Result<()> {
                 file,
                 start_line,
                 end_line,
+                symbol,
                 remote,
             } => {
                 let file = file.canonicalize()?;
                 let generator = jump::GitHubPermalinkGenerator::new(&file, Some(remote))?;
-                let link = generator.generate(&file, start_line, end_line)?;
+                let link =
+                    generator.generate_labeled(&file, start_line, end_line, symbol.as_deref())?;
                 println!("{}", serde_json::to_string_pretty(&link)?);
             }
 

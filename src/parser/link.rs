@@ -191,6 +191,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_symbol_labeled_github_link() {
+        let parser = LinkParser;
+        let input = "[Server::run (main.rs:10-12)](https://github.com/FlakM/jump/blob/main/src/main.rs#L10-L12)";
+
+        let request = parser.parse(input).expect("Expected parsed request");
+
+        assert_eq!(request.kind, JumpLinkKind::Github);
+        assert_eq!(request.path, PathBuf::from("src/main.rs"));
+        assert_eq!(request.line, Some(10));
+        assert_eq!(request.end_line, Some(12));
+    }
+
+    #[test]
     fn parses_relative_path_with_line() {
         let parser = LinkParser;
         let input = "../src/lib.rs:42";
