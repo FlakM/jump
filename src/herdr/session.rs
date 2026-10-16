@@ -21,6 +21,48 @@ use tracing::warn;
 use crate::materializer::MaterializedPath;
 use crate::project::ProjectRoot;
 
+/// Run a command with a hard timeout. A Neovim waiting at a prompt does not answer
+/// RPC, so without this a socket scan can block the whole jump.
+fn run_with_timeout(mut command: Command, timeout: std::time::Duration) -> Result<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to spawn command")?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait().context("failed to poll child")? {
+            Some(_) => break,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("timed out after {:?}", timeout);
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    let status = child.wait().context("failed to collect child")?;
+    if !status.success() {
+        bail!("command failed: {}", stderr.trim());
+    }
+    Ok(stdout)
+}
+
+/// How long a single `herdr` or `nvim` call may take before it is abandoned.
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Executes `herdr` commands and returns their stdout.
 pub trait HerdrCommandExecutor {
     fn run(&self, args: &[&str]) -> Result<String>;
@@ -73,39 +115,26 @@ impl NvimSocket for DefaultNvimSocket {
     }
 
     fn expr(&self, socket: &Path, expression: &str) -> Result<String> {
-        let output = Command::new("nvim")
+        let mut command = Command::new("nvim");
+        command
             .arg("--server")
             .arg(socket)
             .arg("--remote-expr")
-            .arg(expression)
-            .output()
-            .context("Failed to execute nvim --remote-expr")?;
-        if !output.status.success() {
-            bail!(
-                "nvim --remote-expr failed on {}: {}",
-                socket.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            .arg(expression);
+        run_with_timeout(command, CALL_TIMEOUT)
+            .with_context(|| format!("nvim --remote-expr on {}", socket.display()))
     }
 
     fn send(&self, socket: &Path, keys: &str) -> Result<()> {
-        let output = Command::new("nvim")
+        let mut command = Command::new("nvim");
+        command
             .arg("--server")
             .arg(socket)
             .arg("--remote-send")
-            .arg(keys)
-            .output()
-            .context("Failed to execute nvim --remote-send")?;
-        if !output.status.success() {
-            bail!(
-                "nvim --remote-send failed on {}: {}",
-                socket.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        Ok(())
+            .arg(keys);
+        run_with_timeout(command, CALL_TIMEOUT)
+            .map(|_| ())
+            .with_context(|| format!("nvim --remote-send on {}", socket.display()))
     }
 }
 
@@ -115,20 +144,9 @@ pub struct DefaultHerdrExecutor;
 
 impl HerdrCommandExecutor for DefaultHerdrExecutor {
     fn run(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("herdr")
-            .args(args)
-            .output()
-            .context("Failed to execute herdr command")?;
-
-        if !output.status.success() {
-            bail!(
-                "herdr {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        let mut command = Command::new("herdr");
+        command.args(args);
+        run_with_timeout(command, CALL_TIMEOUT).with_context(|| format!("herdr {}", args.join(" ")))
     }
 }
 
@@ -144,11 +162,13 @@ pub struct HerdrPane {
 }
 
 impl HerdrPane {
-    fn under(&self, root: &Path) -> bool {
+    /// Related in either direction: a pane opened on the project, or on a parent of it.
+    /// A monorepo pane opened at the repo root must still serve a jump to a nested crate.
+    fn related(&self, root: &Path) -> bool {
         [self.cwd.as_ref(), self.foreground_cwd.as_ref()]
             .into_iter()
             .flatten()
-            .any(|cwd| cwd.as_path() == root || cwd.starts_with(root))
+            .any(|cwd| cwd.as_path() == root || cwd.starts_with(root) || root.starts_with(cwd))
     }
 
     /// A captured coding agent is not an editor: never type into its prompt.
@@ -254,17 +274,18 @@ impl<E: HerdrCommandExecutor, S: NvimSocket> HerdrSessionManager<E, S> {
         }))
     }
 
-    /// The Neovim pane for this project, preferring one whose working directory is the
-    /// project itself. Falls back to any Neovim pane so a jump still lands somewhere
-    /// useful when the editor was started elsewhere.
+    /// The Neovim pane for this project.
+    ///
+    /// Only panes related to the project are considered: landing in a different
+    /// project's editor would be worse than opening a new one, so a project with no
+    /// editor of its own gets a tab instead (as the tmux backend already does).
     pub fn find_nvim_pane(&self, root: &ProjectRoot) -> Result<Option<HerdrPane>> {
         let panes = self.list_panes()?;
-        let (matching, others): (Vec<HerdrPane>, Vec<HerdrPane>) = panes
+        for pane in panes
             .into_iter()
             .filter(HerdrPane::might_be_editor)
-            .partition(|pane| pane.under(&root.path));
-
-        for pane in matching.into_iter().chain(others) {
+            .filter(|pane| pane.related(&root.path))
+        {
             if self.pane_runs_nvim(&pane.pane_id)? {
                 return Ok(Some(pane));
             }
@@ -341,25 +362,58 @@ impl<E: HerdrCommandExecutor, S: NvimSocket> HerdrSessionManager<E, S> {
     }
 
     /// Open the target through the editor's socket, then confirm it landed.
+    ///
+    /// Remote sends are asynchronous, so the read-back is polled. A failed landing is
+    /// reported rather than papered over: the editor may be waiting at a prompt (a stale
+    /// swap file, for instance), and typing the command into that prompt would make a
+    /// worse mess than an honest error.
     pub fn open_via_socket(&self, socket: &Path, target: &MaterializedPath) -> Result<()> {
         let line = target.line.unwrap_or(1);
         let path = target.absolute.to_string_lossy();
         let keys = format!("<Esc>:edit +{line} {path}<CR>");
         self.nvim_socket.send(socket, &keys)?;
 
-        // Remote sends are asynchronous; read back so a silent no-op cannot be reported
-        // as success.
-        let seen = self
-            .nvim_socket
-            .expr(socket, r#"expand('%:p') .. ':' .. line('.')"#)?;
         let expected = format!("{}:{line}", target.absolute.to_string_lossy());
-        if seen.trim() != expected {
+        let mut seen = String::new();
+        for attempt in 0..15 {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            seen = self
+                .nvim_socket
+                .expr(socket, r#"expand('%:p') .. ':' .. line('.')"#)?
+                .trim()
+                .to_string();
+            if seen == expected {
+                return Ok(());
+            }
+        }
+
+        let mode = self
+            .nvim_socket
+            .expr(socket, "mode(1)")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let pending = self
+            .nvim_socket
+            .expr(socket, "getcmdline()")
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if mode != "n" || !pending.is_empty() {
             bail!(
-                "socket open did not land: expected {expected}, editor reports {}",
-                seen.trim()
+                "Neovim at {} is waiting for an answer (mode {mode}{}); \
+                 a stale swap file or an open prompt blocks the jump — resolve it and retry",
+                socket.display(),
+                if pending.is_empty() {
+                    String::new()
+                } else {
+                    format!(", pending {pending:?}")
+                }
             );
         }
-        Ok(())
+        bail!("socket open did not land: expected {expected}, editor reports {seen}")
     }
 
     /// Send `:edit +LINE PATH` to a Neovim pane, mirroring what nvr does: escape first
@@ -452,15 +506,14 @@ impl<E: HerdrCommandExecutor, S: NvimSocket> HerdrSessionManager<E, S> {
     /// Returns a session label for the outcome.
     pub fn launch(&self, root: &ProjectRoot, target: &MaterializedPath) -> Result<String> {
         if let Some(pane) = self.find_nvim_pane(root)? {
-            // Prefer the editor's own socket; typing into the pane is the last resort.
+            // Prefer the editor's own socket. Typing into the pane is only for the case
+            // where no socket exists at all: typing at a prompt is worse than an error.
             match self.find_socket(&pane, root) {
-                Ok(Some(socket)) => match self.open_via_socket(&socket, target) {
-                    Ok(()) => {
-                        let _ = self.focus(&pane);
-                        return Ok(format!("herdr:{}", pane.pane_id));
-                    }
-                    Err(error) => warn!("socket open failed ({error:#}); typing into the pane"),
-                },
+                Ok(Some(socket)) => {
+                    self.open_via_socket(&socket, target)?;
+                    let _ = self.focus(&pane);
+                    return Ok(format!("herdr:{}", pane.pane_id));
+                }
                 Ok(None) => warn!(
                     "no Neovim socket for {}; typing into the pane",
                     pane.pane_id
@@ -618,8 +671,10 @@ mod tests {
     struct FakeSocket {
         candidates: Vec<PathBuf>,
         cwd_by_socket: HashMap<PathBuf, String>,
-        /// What the post-send read-back reports; defaults to a match for `expect`.
-        after_send: Arc<Mutex<Option<String>>>,
+        /// Read-back values, consumed one per poll; the last value repeats.
+        after_send: Arc<Mutex<Vec<String>>>,
+        mode: String,
+        cmdline: String,
         sends: Arc<Mutex<Vec<(PathBuf, String)>>>,
     }
 
@@ -655,7 +710,22 @@ mod tests {
                     .cloned()
                     .ok_or_else(|| anyhow::anyhow!("no server at {}", socket.display()));
             }
-            Ok(self.after_send.lock().unwrap().clone().unwrap_or_default())
+            if expression.contains("mode(") {
+                return Ok(if self.mode.is_empty() {
+                    "n".to_string()
+                } else {
+                    self.mode.clone()
+                });
+            }
+            if expression.contains("getcmdline") {
+                return Ok(self.cmdline.clone());
+            }
+            let mut queue = self.after_send.lock().unwrap();
+            if queue.len() > 1 {
+                Ok(queue.remove(0))
+            } else {
+                Ok(queue.first().cloned().unwrap_or_default())
+            }
         }
 
         fn send(&self, socket: &Path, keys: &str) -> Result<()> {
@@ -694,7 +764,11 @@ mod tests {
     }
 
     fn expect_after_send(socket: &FakeSocket, path: &str, line: u32) {
-        *socket.after_send.lock().unwrap() = Some(format!("{path}:{line}"));
+        *socket.after_send.lock().unwrap() = vec![format!("{path}:{line}")];
+    }
+
+    fn expect_readback(socket: &FakeSocket, values: &[&str]) {
+        *socket.after_send.lock().unwrap() = values.iter().map(|v| v.to_string()).collect();
     }
 
     #[test]
@@ -727,15 +801,29 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_any_nvim_pane_when_the_project_has_none() {
+    fn does_not_hijack_an_unrelated_projects_editor() {
         let fake = FakeHerdr::new(&[
             ("wV:p2", None, PROJECT, None),
             ("wZ:p3", Some(33), "/home/dev/other", None),
         ]);
         let herdr = HerdrSessionManager::with_executors(fake, FakeSocket::none());
 
-        let found = herdr.find_nvim_pane(&project()).unwrap().unwrap();
-        assert_eq!(found.pane_id, "wZ:p3");
+        assert!(
+            herdr.find_nvim_pane(&project()).unwrap().is_none(),
+            "a project with no editor must get its own tab, not another project's"
+        );
+    }
+
+    #[test]
+    fn matches_a_pane_opened_on_a_parent_of_the_project() {
+        // A monorepo editor opened at /home/dev still serves /home/dev/project.
+        let fake = FakeHerdr::new(&[("wV:p2", Some(22), "/home/dev", None)]);
+        let herdr = HerdrSessionManager::with_executors(fake, FakeSocket::none());
+
+        assert_eq!(
+            herdr.find_nvim_pane(&project()).unwrap().unwrap().pane_id,
+            "wV:p2"
+        );
     }
 
     #[test]
@@ -839,16 +927,52 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_typing_when_the_socket_send_does_not_land() {
+    fn reports_an_actionable_error_instead_of_typing_when_the_editor_is_at_a_prompt() {
+        // A stale swap file leaves Neovim at an E325 prompt; typing the command there
+        // would corrupt the buffer, so the jump must fail loudly instead.
         let fake = FakeHerdr::new(&[("wV:p2", Some(7000), PROJECT, None)]);
-        let socket = FakeSocket::with_socket("/run/user/1000/nvim.7000.0", PROJECT);
-        // Read-back reports the wrong buffer, so the socket path must be abandoned.
-        *socket.after_send.lock().unwrap() = Some("/somewhere/else.rs:1".to_string());
+        let mut socket = FakeSocket::with_socket("/run/user/1000/nvim.7000.0", PROJECT);
+        expect_readback(&socket, &[&format!("{PROJECT}/src/app.rs:1")]);
+        socket.mode = "r?".to_string();
         let herdr = HerdrSessionManager::with_executors(fake.clone(), socket);
 
-        herdr.launch(&project(), &target(Some(5))).unwrap();
+        let error = herdr.launch(&project(), &target(Some(5))).unwrap_err();
 
-        assert!(fake.called("send-text"), "expected the typed fallback");
+        let message = format!("{error:#}");
+        assert!(message.contains("waiting for an answer"), "got: {message}");
+        assert!(!fake.called("send-text"), "must not type into a prompt");
+    }
+
+    #[test]
+    fn reports_the_wrong_buffer_rather_than_typing() {
+        let fake = FakeHerdr::new(&[("wV:p2", Some(7100), PROJECT, None)]);
+        let socket = FakeSocket::with_socket("/run/user/1000/nvim.7100.0", PROJECT);
+        expect_readback(&socket, &["/somewhere/else.rs:1"]);
+        let herdr = HerdrSessionManager::with_executors(fake.clone(), socket);
+
+        let error = herdr.launch(&project(), &target(Some(5))).unwrap_err();
+
+        assert!(format!("{error:#}").contains("did not land"));
+        assert!(!fake.called("send-text"));
+    }
+
+    #[test]
+    fn polls_a_slow_landing_before_deciding_it_failed() {
+        let fake = FakeHerdr::new(&[("wV:p2", Some(7200), PROJECT, None)]);
+        let socket = FakeSocket::with_socket("/run/user/1000/nvim.7200.0", PROJECT);
+        // First poll still shows the old buffer; the second shows the jump landed.
+        expect_readback(
+            &socket,
+            &[
+                &format!("{PROJECT}/src/app.rs:1"),
+                &format!("{PROJECT}/src/lib.rs:9"),
+            ],
+        );
+        let herdr = HerdrSessionManager::with_executors(fake, socket.clone());
+
+        herdr.launch(&project(), &target(Some(9))).unwrap();
+
+        assert_eq!(socket.sends().len(), 1);
     }
 
     #[test]
