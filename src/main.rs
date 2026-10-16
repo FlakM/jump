@@ -325,6 +325,25 @@ fn verify_system() -> Result<()> {
         .map(|_| format!("{}✓{} active", GREEN, RESET))
         .unwrap_or_else(|| format!("{}-{} not running", DIM, RESET));
 
+    // Check herdr: a first-class backend, so report it even when tmux is down.
+    let herdr_status = if std::env::var("HERDR_ENV")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
+        match Command::new("herdr").args(["pane", "list"]).output() {
+            Ok(output) if output.status.success() => {
+                let panes = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+                    .ok()
+                    .and_then(|value| value["result"]["panes"].as_array().map(Vec::len))
+                    .unwrap_or(0);
+                format!("{}✓{} {} panes", GREEN, RESET, panes)
+            }
+            _ => format!("{}✗{} server unreachable", RED, RESET),
+        }
+    } else {
+        format!("{}-{} not in a herdr pane", DIM, RESET)
+    };
+
     println!("{}Jump System Verification{}", BOLD, RESET);
     println!("========================\n");
 
@@ -348,6 +367,7 @@ fn verify_system() -> Result<()> {
 
     println!("\n{}Services:{}", BOLD, RESET);
     println!("  tmux server:  {}", tmux_status);
+    println!("  herdr:        {}", herdr_status);
     println!("  hyprland:     {}", hyprland_status);
 
     // Log file location

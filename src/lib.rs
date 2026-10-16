@@ -2,6 +2,7 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod git;
+pub mod herdr;
 pub mod hyprland;
 pub mod lsp;
 pub mod materializer;
@@ -18,6 +19,10 @@ pub use app::{
 };
 pub use config::{ConfigLoader, JumpConfig, ProjectConfig};
 pub use git::{GitHubLink, GitHubPermalinkGenerator, PermalinkGenerator};
+pub use herdr::{
+    DefaultHerdrExecutor, DefaultNvimSocket, HerdrCommandExecutor, HerdrPane, HerdrSessionManager,
+    NvimSocket,
+};
 pub use hyprland::{find_largest_kitty, focus_window, list_clients, HyprlandWindow, Workspace};
 pub use lsp::{DefinitionProvider, HoverProvider, LspClient, LspConnection};
 pub use materializer::{FilesystemMaterializer, MaterializedPath, PathMaterializer};

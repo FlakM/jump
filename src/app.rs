@@ -8,15 +8,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     create_extractor, detect_language, DefinitionProvider, EnvAndSocketLocator, FastProjectScanner,
-    FilesystemMaterializer, GitHubPermalinkGenerator, HoverOutput, HoverProvider, JumpConfig,
-    JumpLinkKind, JumpLinkParser, JumpRequest, LinkParser, LspClient, LspConnection,
-    MarkdownFormatter, MaterializedPath, NeovimClient, NeovimInstanceLocator, PathMaterializer,
-    PermalinkGenerator, ProjectRoot, ProjectRootLocator, ReferenceFormatter, SessionInfo,
-    SessionInventory, SessionProvisioner, TmuxSessionManager,
+    FilesystemMaterializer, GitHubPermalinkGenerator, HerdrSessionManager, HoverOutput,
+    HoverProvider, JumpConfig, JumpLinkKind, JumpLinkParser, JumpRequest, LinkParser, LspClient,
+    LspConnection, MarkdownFormatter, MaterializedPath, NeovimClient, NeovimInstanceLocator,
+    PathMaterializer, PermalinkGenerator, ProjectRoot, ProjectRootLocator, ReferenceFormatter,
+    SessionInfo, SessionInventory, SessionProvisioner, TmuxSessionManager,
 };
 
 pub struct HoverRequest {
@@ -841,6 +841,17 @@ pub async fn jump(input: JumpInput) -> Result<JumpOutcome> {
 
     let materializer = FilesystemMaterializer;
     let target = materializer.materialize(&root, &jump_req)?;
+
+    // Preferred backend: herdr, when this process runs inside a herdr pane. Herdr knows
+    // every pane across workspaces, so a jump can find the editor even when the project
+    // lives elsewhere. A herdr failure must not block the tmux path.
+    if HerdrSessionManager::available() {
+        let herdr = HerdrSessionManager::new();
+        match herdr.launch(&root, &target) {
+            Ok(session) => return Ok(build_outcome(session, &target)),
+            Err(error) => warn!("herdr backend unavailable, falling back to tmux: {error:#}"),
+        }
+    }
 
     let tmux = TmuxSessionManager::new();
 
